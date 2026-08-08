@@ -27,3 +27,11 @@ Then run the tests:
 ```bash
 pytest
 ```
+
+To create a vector store, prepare the data in json format with 'id' and 'context', then modify *FAQ_DATA_PATH*.
+After that, run the qdrant docker image:
+```bash
+mkdir -p ~/qdrant_storage
+docker run -d --name qdran -p 6333:6333 -p 6334:6334 -v ~/qdrant_storage:/qdrant/storage:Z qdrant/qdrant
+```
+Then run the chainlit app and use the RAG pipeline

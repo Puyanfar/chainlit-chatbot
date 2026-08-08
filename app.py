@@ -1,6 +1,7 @@
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from typing import cast
+from qdrant_client import AsyncQdrantClient
 import chainlit as cl
 import logging
 import config
@@ -16,6 +17,36 @@ client = AsyncOpenAI(
     max_retries=config.MAX_RETRIES,
 )
 
+qdrant_client = AsyncQdrantClient(url=config.QDRANT_URL)
+
+
+async def retrieve_context(query: str) -> str:
+    try:
+        embedding_response = await client.embeddings.create(
+            model=config.EMBEDDING_MODEL,
+            input=query,
+        )
+        query_vector = embedding_response.data[0].embedding
+
+        results = await qdrant_client.query_points(
+            collection_name=config.QDRANT_COLLECTION_NAME,
+            query=query_vector,
+            limit=config.RAG_TOP_K,
+            score_threshold=config.RAG_SCORE_THRESHOLD,
+        )
+
+    except Exception:
+        logging.exception(
+            "Retrieval from Qdrant failed; continuing without RAG context"
+        )
+        return ""
+
+    if not results.points:
+        return ""
+
+    chunks = [point.payload["context"] for point in results.points if point.payload]
+    return "\n\n---\n\n".join(chunks)
+
 
 @cl.on_chat_start
 async def start():
@@ -25,6 +56,22 @@ async def start():
 @cl.on_message
 async def main(message: cl.Message):
     message_history = cl.user_session.get("message_history") or [SYSTEM_PROMPT]
+
+    retrieved_context = await retrieve_context(message.content)
+
+    if retrieved_context:
+        print(retrieved_context)
+        augmented_content = (
+            "Use the following context to answer the question if relevant. "
+            "If the context doesn't contain the answer, say so and answer from "
+            "your own knowledge if you can.\n\n"
+            f"Context:\n{retrieved_context}\n\n"
+            f"Question: {message.content}"
+        )
+    else:
+        augmented_content = message.content
+ 
+    request_messages = message_history + [{"role": "user", "content": augmented_content}]
     message_history.append({"role": "user", "content": message.content})
 
     msg = cl.Message(content="")
@@ -36,7 +83,7 @@ async def main(message: cl.Message):
     try:
         stream = await client.chat.completions.create(
             model=config.MODEL,
-            messages=cast(list[ChatCompletionMessageParam], message_history),
+            messages=cast(list[ChatCompletionMessageParam], request_messages),
             stream=True,
         )
 
@@ -64,9 +111,7 @@ async def main(message: cl.Message):
             )
 
         else:
-            msg.content = (
-                f"{ERROR_MARKER} ERROR! Sorry, something went wrong talking to the model: {e}"
-            )
+            msg.content = f"{ERROR_MARKER} ERROR! Sorry, something went wrong talking to the model: {e}"
 
     await msg.update()
 
