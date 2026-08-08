@@ -58,20 +58,22 @@ async def main(message: cl.Message):
     message_history = cl.user_session.get("message_history") or [SYSTEM_PROMPT]
 
     retrieved_context = await retrieve_context(message.content)
-
+    augmented_content = (
+        "Use the following context to answer the question if relevant. "
+        "If the context doesn't contain the answer, say you do not have the information. "
+        "Do not answer from your own knowledge \n\n"
+    )
     if retrieved_context:
-        print(retrieved_context)
-        augmented_content = (
-            "Use the following context to answer the question if relevant. "
-            "If the context doesn't contain the answer, say so and answer from "
-            "your own knowledge if you can.\n\n"
-            f"Context:\n{retrieved_context}\n\n"
-            f"Question: {message.content}"
-        )
+        augmented_content += f"Context:\n{retrieved_context}\n\n"
     else:
-        augmented_content = message.content
- 
-    request_messages = message_history + [{"role": "user", "content": augmented_content}]
+        augmented_content += (
+            "Context:\n No relevant context was found in the knowledge base.\n\n"
+        )
+    augmented_content += f"Question:\n {message.content}\n\n"
+
+    request_messages = message_history + [
+        {"role": "user", "content": augmented_content}
+    ]
     message_history.append({"role": "user", "content": message.content})
 
     msg = cl.Message(content="")
