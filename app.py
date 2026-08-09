@@ -3,8 +3,10 @@ from openai.types.chat import ChatCompletionMessageParam
 from typing import cast
 from qdrant_client import AsyncQdrantClient
 import chainlit as cl
-import logging
+import logging, asyncio
 import config
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = {"role": "system", "content": config.SYSTEM_PROMPT}
 MAX_HISTORY_MESSAGES = config.MAX_HISTORY_MESSAGES
@@ -28,23 +30,55 @@ async def retrieve_context(query: str) -> str:
         )
         query_vector = embedding_response.data[0].embedding
 
-        results = await qdrant_client.query_points(
-            collection_name=config.QDRANT_COLLECTION_NAME,
-            query=query_vector,
-            limit=config.RAG_TOP_K,
-            score_threshold=config.RAG_SCORE_THRESHOLD,
+        questions_results, qa_results = await asyncio.gather(
+            qdrant_client.query_points(
+                collection_name=config.QDRANT_QUESTIONS_COLLECTION,
+                query=query_vector,
+                limit=config.RAG_TOP_K,
+                score_threshold=config.RAG_SCORE_THRESHOLD,
+            ),
+            qdrant_client.query_points(
+                collection_name=config.QDRANT_QA_COLLECTION,
+                query=query_vector,
+                limit=config.RAG_TOP_K,
+                score_threshold=config.RAG_SCORE_THRESHOLD,
+            ),
         )
 
     except Exception:
-        logging.exception(
-            "Retrieval from Qdrant failed; continuing without RAG context"
+        logger.exception("Retrieval from Qdrant failed; continuing without RAG context")
+        return ""
+
+    merged: dict[str, tuple[float, dict]] = {}
+    for results in (questions_results, qa_results):
+        for point in results.points:
+            if not point.payload:
+                continue
+            faq_id = str(point.id)
+            if faq_id not in merged:
+                merged[faq_id] = (point.score, point.payload)
+
+    if not merged:
+        logging.info(
+            "No chunks passed RAG_SCORE_THRESHOLD=%.2f; skipping context.",
+            config.RAG_SCORE_THRESHOLD,
         )
         return ""
 
-    if not results.points:
-        return ""
+    top_entries = sorted(merged.values(), key=lambda entry: entry[0], reverse=True)[
+        : config.RAG_TOP_K
+    ]
 
-    chunks = [point.payload["context"] for point in results.points if point.payload]
+    logging.info(
+        "Using %d merged chunk(s), scores: %s",
+        len(top_entries),
+        [round(score, 3) for score, _ in top_entries],
+    )
+
+    chunks = [
+        f"Q: {payload['question']}\nA: {payload['answer']}"
+        for _, payload in top_entries
+    ]
     return "\n\n---\n\n".join(chunks)
 
 
@@ -58,18 +92,15 @@ async def main(message: cl.Message):
     message_history = cl.user_session.get("message_history") or [SYSTEM_PROMPT]
 
     retrieved_context = await retrieve_context(message.content)
-    augmented_content = (
-        "Use the following context to answer the question if relevant. "
-        "If the context doesn't contain the answer, say you do not have the information. "
-        "Do not answer from your own knowledge \n\n"
-    )
+
+    augmented_content = f"User Question:\n {message.content}\n\n"
+
     if retrieved_context:
-        augmented_content += f"Context:\n{retrieved_context}\n\n"
+        augmented_content += f"Reference Information:\n{retrieved_context}\n\n"
     else:
         augmented_content += (
-            "Context:\n No relevant context was found in the knowledge base.\n\n"
+            "Reference Information:\n No relevant information was found in the knowledge base.\n\n"
         )
-    augmented_content += f"Question:\n {message.content}\n\n"
 
     request_messages = message_history + [
         {"role": "user", "content": augmented_content}
@@ -104,7 +135,7 @@ async def main(message: cl.Message):
         stream_succeeded = True
 
     except Exception as e:
-        logging.exception("Error while streaming response from model")
+        logger.exception("Error while streaming response from model")
 
         if full_response:
             msg.content = (
