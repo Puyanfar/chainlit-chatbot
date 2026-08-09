@@ -56,16 +56,25 @@ async def initialize_embedding_size():
 
 
 QDRANT_URL: str = os.getenv("QDRANT_URL", "http://localhost:6333")
-QDRANT_QUESTIONS_COLLECTION: str = os.getenv("QDRANT_QUESTIONS_COLLECTION", "faq_questions")
+QDRANT_QUESTIONS_COLLECTION: str = os.getenv(
+    "QDRANT_QUESTIONS_COLLECTION", "faq_questions"
+)
 QDRANT_QA_COLLECTION: str = os.getenv("QDRANT_QA_COLLECTION", "faq_qa")
-
-FAQ_API_HOST: str = os.getenv("FAQ_API_HOST", "0.0.0.0")
-FAQ_API_PORT: int = int(os.getenv("FAQ_API_PORT", "8001"))  # different from Chainlit's port
 
 RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "3"))
 RAG_SCORE_THRESHOLD: float = float(os.getenv("RAG_SCORE_THRESHOLD", "0.45"))
 
 FAQ_DATA_PATH: str = os.getenv("FAQ_DATA_PATH", "data/faq_data.json")
+FAQ_API_HOST: str = os.getenv(
+    "FAQ_API_HOST", "0.0.0.0"
+)  # bind address the server listens on
+FAQ_API_PORT: int = int(
+    os.getenv("FAQ_API_PORT", "8001")
+)  # different from Chainlit's port
+FAQ_API_BASE_URL: str = os.getenv(
+    "FAQ_API_BASE_URL", "http://localhost:8001"
+)  # address a client calls
+
 
 SAFETY_SYS_PROMPT: str = """
 

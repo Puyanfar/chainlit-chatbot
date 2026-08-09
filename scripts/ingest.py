@@ -1,20 +1,37 @@
+"""
+Ingestion script for the new FAQ format: a JSON list of {"question", "answer"}
+items, with no id (the API assigns ids itself).
+
+Unlike the old version, this script does NOT talk to Qdrant or OpenAI
+directly - it sends the data to the standalone FAQ API in batches over HTTP.
+That keeps the API as the single place that knows how to correctly embed and
+store an FAQ entry; this script is just a bulk client of it.
+
+Safe to re-run: the API derives each entry's id deterministically from its
+question text, so re-running with the same question updates that entry in
+place rather than creating a duplicate.
+
+Requires the FAQ API to be running first:
+    uvicorn api.main:app --host 0.0.0.0 --port 8001
+
+Run:
+    python ingest.py
+"""
+
 import asyncio
-import json, logging, sys, uuid
+import json
+import logging
+import sys
 from pathlib import Path
-from openai import AsyncOpenAI
-from qdrant_client import AsyncQdrantClient, models
+
+import httpx
+
 import config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-openai_client = AsyncOpenAI(
-    base_url=config.API_ENDPOINT,
-    api_key=config.API_KEY,
-    timeout=config.REQUEST_TIMEOUT,
-    max_retries=config.MAX_RETRIES,
-)
-qdrant_client = AsyncQdrantClient(url=config.QDRANT_URL)
+BATCH_SIZE = config.EMBEDDING_BATCH_SIZE
 
 
 def load_faq_data(path: str) -> list[dict]:
@@ -24,90 +41,76 @@ def load_faq_data(path: str) -> list[dict]:
         sys.exit(1)
 
     with file_path.open("r", encoding="utf-8") as f:
-        try:
-            data = json.load(f)
-        except Exception as e:
-            logger.error("FAQ data file is not a valid JSON file: %s", e)
+        data = json.load(f)
 
     if not isinstance(data, list) or not data:
-        logger.error("Expected a non-empty JSON list of {id, context} items.")
+        logger.error("Expected a non-empty JSON list of {question, answer} items.")
         sys.exit(1)
 
     for item in data:
-        if "id" not in item or "context" not in item:
-            logger.error("Each item must have 'id' and 'context'. Bad item: %s", item)
+        if "question" not in item or "answer" not in item:
+            logger.error("Each item must have 'question' and 'answer'. Bad item: %s", item)
             sys.exit(1)
 
     return data
 
 
-async def ensure_collection() -> None:
-    exists = await qdrant_client.collection_exists(config.QDRANT_COLLECTION_NAME)
-    if exists:
-        logger.info("Collection '%s' already exists.", config.QDRANT_COLLECTION_NAME)
-        return
-
-    await config.initialize_embedding_size()
-
-    await qdrant_client.create_collection(
-        collection_name=config.QDRANT_COLLECTION_NAME,
-        vectors_config=models.VectorParams(
-            size=config.EMBEDDING_SIZE,
-            distance=models.Distance.COSINE,
-        ),
-    )
-    logger.info("Created collection '%s'.", config.QDRANT_COLLECTION_NAME)
-
-
-async def embed_batch(texts: list[str]) -> list[list[float]]:
-    response = await openai_client.embeddings.create(
-        model=config.EMBEDDING_MODEL,
-        input=texts,
-    )
-    return [item.embedding for item in response.data]
+async def check_api_available(client: httpx.AsyncClient) -> bool:
+    try:
+        response = await client.get("/health")
+        return response.status_code == 200
+    except httpx.HTTPError:
+        return False
 
 
 async def ingest() -> None:
     data = load_faq_data(config.FAQ_DATA_PATH)
     logger.info("Loaded %d FAQ items from %s", len(data), config.FAQ_DATA_PATH)
 
-    await ensure_collection()
+    created = 0
+    updated = 0
+    failed = 0
 
-    batch_size = config.EMBEDDING_BATCH_SIZE
-    total_upserted = 0
+    async with httpx.AsyncClient(
+        base_url=config.FAQ_API_BASE_URL, timeout=config.REQUEST_TIMEOUT
+    ) as client:
 
-    for i in range(0, len(data), batch_size):
-        batch = data[i : i + batch_size]
-        texts = [item["context"] for item in batch]
-
-        try:
-            vectors = await embed_batch(texts)
-        except Exception:
-            logger.exception("Embedding failed for batch starting at index %d", i)
-            continue
-
-        points = [
-            models.PointStruct(
-                id=uuid.uuid5(uuid.NAMESPACE_DNS, str(item["id"])),
-                vector=vector,
-                payload={"context": item["context"]},
+        if not await check_api_available(client):
+            logger.error(
+                "Can't reach the FAQ API at %s. Is it running? "
+                "(uvicorn api.main:app --host 0.0.0.0 --port 8001)",
+                config.FAQ_API_BASE_URL,
             )
-            for item, vector in zip(batch, vectors)
-        ]
+            sys.exit(1)
 
-        await qdrant_client.upsert(
-            collection_name=config.QDRANT_COLLECTION_NAME,
-            points=points,
-        )
+        for i in range(0, len(data), BATCH_SIZE):
+            batch = data[i : i + BATCH_SIZE]
+            payload = {
+                "items": [
+                    {"question": item["question"], "answer": item["answer"]}
+                    for item in batch
+                ]
+            }
 
-        total_upserted += len(points)
-        logger.info("Upserted %d/%d items", total_upserted, len(data))
+            try:
+                response = await client.post("/faq/batch", json=payload)
+                response.raise_for_status()
+            except httpx.HTTPError:
+                logger.exception("Batch starting at index %d failed", i)
+                failed += len(batch)
+                continue
 
-    count = await qdrant_client.count(config.QDRANT_COLLECTION_NAME, exact=True)
+            for result in response.json():
+                if result.get("updated"):
+                    updated += 1
+                else:
+                    created += 1
+
+            logger.info("Processed %d/%d items", min(i + BATCH_SIZE, len(data)), len(data))
+
     logger.info(
-        "Done. Collection '%s' now has %d points.",
-        config.QDRANT_COLLECTION_NAME,
-        count.count,
+        "Done. Created: %d, Updated: %d, Failed: %d, Total: %d",
+        created, updated, failed, len(data),
     )
 
 
