@@ -42,7 +42,6 @@ Alternatively, you can use the ingest API to add question/answer pairs one-by-on
 ```bash
 uvicorn api.main:app --host 0.0.0.0 --port 8001 --reload
 ```
-
-
+Then add a question answer pair from /faq route or a batch from /faq/batch route
 
 Then run the chainlit app and use the RAG pipeline
