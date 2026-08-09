@@ -62,7 +62,7 @@ QDRANT_QUESTIONS_COLLECTION: str = os.getenv(
 QDRANT_QA_COLLECTION: str = os.getenv("QDRANT_QA_COLLECTION", "faq_qa")
 
 RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "3"))
-RAG_SCORE_THRESHOLD: float = float(os.getenv("RAG_SCORE_THRESHOLD", "0.45"))
+RAG_SCORE_THRESHOLD: float = float(os.getenv("RAG_SCORE_THRESHOLD", "0.4"))
 
 FAQ_DATA_PATH: str = os.getenv("FAQ_DATA_PATH", "data/faq_data.json")
 FAQ_API_HOST: str = os.getenv(
