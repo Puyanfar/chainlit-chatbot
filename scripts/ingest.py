@@ -18,14 +18,12 @@ Run:
     python ingest.py
 """
 
+from pathlib import Path
 import asyncio
 import json
 import logging
 import sys
-from pathlib import Path
-
 import httpx
-
 import config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -49,7 +47,9 @@ def load_faq_data(path: str) -> list[dict]:
 
     for item in data:
         if "question" not in item or "answer" not in item:
-            logger.error("Each item must have 'question' and 'answer'. Bad item: %s", item)
+            logger.error(
+                "Each item must have 'question' and 'answer'. Bad item: %s", item
+            )
             sys.exit(1)
 
     return data
@@ -106,11 +106,16 @@ async def ingest() -> None:
                 else:
                     created += 1
 
-            logger.info("Processed %d/%d items", min(i + BATCH_SIZE, len(data)), len(data))
+            logger.info(
+                "Processed %d/%d items", min(i + BATCH_SIZE, len(data)), len(data)
+            )
 
     logger.info(
         "Done. Created: %d, Updated: %d, Failed: %d, Total: %d",
-        created, updated, failed, len(data),
+        created,
+        updated,
+        failed,
+        len(data),
     )
 
 

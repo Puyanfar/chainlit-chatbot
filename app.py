@@ -1,16 +1,17 @@
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from typing import cast
-from qdrant_client import AsyncQdrantClient
 import chainlit as cl
-import logging, asyncio
+import logging
 import config
+from rag import retrieve
 
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = {"role": "system", "content": config.SYSTEM_PROMPT}
 MAX_HISTORY_MESSAGES = config.MAX_HISTORY_MESSAGES
 ERROR_MARKER = "⚠️"
+FOLLOW_UP_ACTION_NAME = "follow_up_question"
 
 client = AsyncOpenAI(
     base_url=config.API_ENDPOINT,
@@ -19,93 +20,42 @@ client = AsyncOpenAI(
     max_retries=config.MAX_RETRIES,
 )
 
-qdrant_client = AsyncQdrantClient(url=config.QDRANT_URL)
 
-
-async def retrieve_context(query: str) -> str:
-    try:
-        embedding_response = await client.embeddings.create(
-            model=config.EMBEDDING_MODEL,
-            input=query,
+def build_follow_up_actions(suggestions: list[dict]) -> list[cl.Action]:
+    """One cl.Action per suggestion, all sharing the same action name (the
+    callback below is registered against that name) - each carries its own
+    question text in its payload so the callback knows which was clicked."""
+    return [
+        cl.Action(
+            name=FOLLOW_UP_ACTION_NAME,
+            payload={"question": suggestion["question"]},
+            label=suggestion["question"],
         )
-        query_vector = embedding_response.data[0].embedding
-
-        questions_results, qa_results = await asyncio.gather(
-            qdrant_client.query_points(
-                collection_name=config.QDRANT_QUESTIONS_COLLECTION,
-                query=query_vector,
-                limit=config.RAG_TOP_K,
-                score_threshold=config.RAG_SCORE_THRESHOLD,
-            ),
-            qdrant_client.query_points(
-                collection_name=config.QDRANT_QA_COLLECTION,
-                query=query_vector,
-                limit=config.RAG_TOP_K,
-                score_threshold=config.RAG_SCORE_THRESHOLD,
-            ),
-        )
-
-    except Exception:
-        logger.exception("Retrieval from Qdrant failed; continuing without RAG context")
-        return ""
-
-    merged: dict[str, tuple[float, dict]] = {}
-    for results in (questions_results, qa_results):
-        for point in results.points:
-            if not point.payload:
-                continue
-            faq_id = str(point.id)
-            if faq_id not in merged:
-                merged[faq_id] = (point.score, point.payload)
-
-    if not merged:
-        logging.info(
-            "No chunks passed RAG_SCORE_THRESHOLD=%.2f; skipping context.",
-            config.RAG_SCORE_THRESHOLD,
-        )
-        return ""
-
-    top_entries = sorted(merged.values(), key=lambda entry: entry[0], reverse=True)[
-        : config.RAG_TOP_K
+        for suggestion in suggestions
     ]
 
-    logging.info(
-        "Using %d merged chunk(s), scores: %s",
-        len(top_entries),
-        [round(score, 3) for score, _ in top_entries],
-    )
 
-    chunks = [
-        f"Q: {payload['question']}\nA: {payload['answer']}"
-        for _, payload in top_entries
-    ]
-    return "\n\n---\n\n".join(chunks)
-
-
-@cl.on_chat_start
-async def start():
-    cl.user_session.set("message_history", [SYSTEM_PROMPT])
-
-
-@cl.on_message
-async def main(message: cl.Message):
+async def answer_question(question: str) -> None:
+    """Core answering logic, shared by both a typed message and a clicked
+    follow-up suggestion: retrieve, stream the model's response, update
+    history, then offer any follow-up suggestions as clickable actions."""
     message_history = cl.user_session.get("message_history") or [SYSTEM_PROMPT]
 
-    retrieved_context = await retrieve_context(message.content)
+    retrieval = await retrieve(question)
+    retrieved_context = retrieval["context"]
+    suggestions = retrieval["suggestions"]
 
-    augmented_content = f"User Question:\n {message.content}\n\n"
+    augmented_content = f"User Question:\n {question}\n\n"
 
     if retrieved_context:
         augmented_content += f"Reference Information:\n{retrieved_context}\n\n"
     else:
-        augmented_content += (
-            "Reference Information:\n No relevant information was found in the knowledge base.\n\n"
-        )
+        augmented_content += "Reference Information:\n No relevant information was found in the knowledge base.\n\n"
 
     request_messages = message_history + [
         {"role": "user", "content": augmented_content}
     ]
-    message_history.append({"role": "user", "content": message.content})
+    message_history.append({"role": "user", "content": question})
 
     msg = cl.Message(content="")
     await msg.send()
@@ -155,3 +105,25 @@ async def main(message: cl.Message):
             message_history = [SYSTEM_PROMPT] + message_history[-MAX_HISTORY_MESSAGES:]
 
         cl.user_session.set("message_history", message_history)
+
+    if stream_succeeded and suggestions:
+        actions = build_follow_up_actions(suggestions)
+        await cl.Message(content="You might also want to ask:", actions=actions).send()
+
+
+@cl.on_chat_start
+async def start():
+    cl.user_session.set("message_history", [SYSTEM_PROMPT])
+
+
+@cl.on_message
+async def main(message: cl.Message):
+    await answer_question(message.content)
+
+
+@cl.action_callback(FOLLOW_UP_ACTION_NAME)
+async def on_follow_up_click(action: cl.Action):
+    question = action.payload.get("question", "")
+    await action.remove()  # remove just the clicked button; the other suggestions stay clickable
+    if question:
+        await answer_question(question)
