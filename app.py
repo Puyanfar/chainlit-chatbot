@@ -12,6 +12,7 @@ SYSTEM_PROMPT = {"role": "system", "content": config.SYSTEM_PROMPT}
 MAX_HISTORY_MESSAGES = config.MAX_HISTORY_MESSAGES
 ERROR_MARKER = "⚠️"
 FOLLOW_UP_ACTION_NAME = "follow_up_question"
+ASSISTANT_AUTHOR = "assistant"
 
 client = AsyncOpenAI(
     base_url=config.API_ENDPOINT,
@@ -44,7 +45,7 @@ async def clear_active_follow_ups() -> None:
 
     active_message = cl.user_session.get("active_follow_up_message")
     if active_message:
-        await active_message.remove_actions()
+        await active_message.remove()
         cl.user_session.set("active_follow_up_message", None)
 
 
@@ -75,7 +76,7 @@ async def answer_question(question: str) -> None:
     ]
     message_history.append({"role": "user", "content": question})
 
-    msg = cl.Message(content="")
+    msg = cl.Message(content="", author=ASSISTANT_AUTHOR)
     await msg.send()
     full_response = ""
 
@@ -132,7 +133,7 @@ async def answer_question(question: str) -> None:
 
     if stream_succeeded and suggestions:
         actions = build_follow_up_actions(suggestions)
-        follow_up_message = cl.Message(content="", actions=actions)
+        follow_up_message = cl.Message(content="", actions=actions, author=ASSISTANT_AUTHOR)
         await follow_up_message.send()
         cl.user_session.set("active_follow_up_message", follow_up_message)
 
