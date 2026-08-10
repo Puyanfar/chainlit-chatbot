@@ -2,3 +2,7 @@
   unicode-bidi: plaintext;
   text-align: start;
 }
+
+button:dir(rtl) {
+  margin-inline-start: auto;  /* pushes button to the right edge */
+}
