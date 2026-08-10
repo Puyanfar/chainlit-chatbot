@@ -108,7 +108,7 @@ async def answer_question(question: str) -> None:
 
     if stream_succeeded and suggestions:
         actions = build_follow_up_actions(suggestions)
-        await cl.Message(content="You might also want to ask:", actions=actions).send()
+        await cl.Message(content="", actions=actions).send()
 
 
 @cl.on_chat_start
@@ -124,6 +124,7 @@ async def main(message: cl.Message):
 @cl.action_callback(FOLLOW_UP_ACTION_NAME)
 async def on_follow_up_click(action: cl.Action):
     question = action.payload.get("question", "")
-    await action.remove()  # remove just the clicked button; the other suggestions stay clickable
+    await action.remove()
     if question:
+        await cl.Message(content=question, type="user_message").send()
         await answer_question(question)
