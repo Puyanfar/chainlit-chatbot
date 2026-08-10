@@ -35,15 +35,33 @@ def build_follow_up_actions(suggestions: list[dict]) -> list[cl.Action]:
     ]
 
 
+async def clear_active_follow_ups() -> None:
+    """Remove the buttons from whatever follow-up suggestion message is
+    currently outstanding, if any. Called at the very start of handling any
+    new question - typed or clicked - so there's only ever one live set of
+    suggestions on screen at a time, regardless of how the previous round
+    was resolved."""
+
+    active_message = cl.user_session.get("active_follow_up_message")
+    if active_message:
+        await active_message.remove_actions()
+        cl.user_session.set("active_follow_up_message", None)
+
+
 async def answer_question(question: str) -> None:
     """Core answering logic, shared by both a typed message and a clicked
     follow-up suggestion: retrieve, stream the model's response, update
     history, then offer any follow-up suggestions as clickable actions."""
-    message_history = cl.user_session.get("message_history") or [SYSTEM_PROMPT]
 
-    retrieval = await retrieve(question)
+    await clear_active_follow_ups()
+
+    message_history = cl.user_session.get("message_history") or [SYSTEM_PROMPT]
+    used_faq_ids = cl.user_session.get("used_faq_ids") or set()
+
+    retrieval = await retrieve(question, exclude_ids=used_faq_ids)
     retrieved_context = retrieval["context"]
     suggestions = retrieval["suggestions"]
+    context_ids = retrieval["context_ids"]
 
     augmented_content = f"User Question:\n {question}\n\n"
 
@@ -106,14 +124,24 @@ async def answer_question(question: str) -> None:
 
         cl.user_session.set("message_history", message_history)
 
+    # Whatever FAQ entries grounded this answer are now "used" - never
+    # suggest them again as a follow-up for the rest of this session.
+    if context_ids:
+        cl.user_session.set("used_faq_ids", used_faq_ids | set(context_ids))
+
+
     if stream_succeeded and suggestions:
         actions = build_follow_up_actions(suggestions)
-        await cl.Message(content="", actions=actions).send()
+        follow_up_message = cl.Message(content="", actions=actions)
+        await follow_up_message.send()
+        cl.user_session.set("active_follow_up_message", follow_up_message)
 
 
 @cl.on_chat_start
 async def start():
     cl.user_session.set("message_history", [SYSTEM_PROMPT])
+    cl.user_session.set("active_follow_up_message", None)
+    cl.user_session.set("used_faq_ids", set())
 
 
 @cl.on_message
@@ -124,7 +152,13 @@ async def main(message: cl.Message):
 @cl.action_callback(FOLLOW_UP_ACTION_NAME)
 async def on_follow_up_click(action: cl.Action):
     question = action.payload.get("question", "")
-    await action.remove()
     if question:
+        # A callback-triggered message doesn't go through the normal user-input
+        # path, so nothing puts it in the UI on its own - explicitly send it as
+        # a user-authored bubble before generating the answer, so the click
+        # reads exactly like the user having typed the question themselves.
+        # (The clicked button itself, and any other stale ones, get cleared
+        # inside answer_question via clear_active_follow_ups().)
         await cl.Message(content=question, type="user_message").send()
         await answer_question(question)
+

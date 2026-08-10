@@ -13,25 +13,47 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
-async def retrieve(query: str) -> dict:
-    """Search both collections once and produce two things from the same
+async def retrieve(query: str, exclude_ids: set[str] | None = None) -> dict:
+    """Search both collections once and produce three things from the same
     result set:
       - "context": the FAQ text to ground the answer in (only entries that
         clear the strict RAG_SCORE_THRESHOLD).
+      - "context_ids": the faq_ids behind that context - the caller uses this
+        to track "entries already used", so they're not suggested again later.
       - "suggestions": other related FAQ questions worth offering as
         clickable follow-ups (entries that clear the looser
-        RAG_SUGGESTION_SCORE_THRESHOLD but weren't already used for context).
-
-    Returns {"context": str, "suggestions": [{"id": str, "question": str}, ...]}.
-    Both are empty on failure or when nothing relevant is found.
+        RAG_SUGGESTION_SCORE_THRESHOLD, weren't already used for context this
+        turn, AND aren't in exclude_ids - i.e. weren't already asked/used in
+        an earlier turn this session).
+ 
+    exclude_ids only affects the *suggestions* list, never grounding - if the
+    user re-asks something close to a question they already covered, it can
+    still ground a fresh answer; it just won't be offered again as a "you
+    might also ask" suggestion.
+ 
+    These two outputs are otherwise independent - the score gap between the
+    two thresholds means there's a real middle ground: candidates related
+    enough to suggest but not confident enough to answer with. In that case
+    "context" comes back empty while "suggestions" still has entries - closer
+    to a "did you mean one of these?" than plain silence. Suggestions are
+    never separately generated - they're always a subset of what we already
+    retrieved, so every suggestion is guaranteed to be a real, answerable
+    FAQ entry.
+ 
+    Returns {"context": str, "context_ids": [str, ...],
+             "suggestions": [{"id": str, "question": str}, ...]}.
+    context/context_ids/suggestions are all empty only when nothing clears
+    even the loose threshold, or on a retrieval failure.
     """
-    empty = {"context": "", "suggestions": []}
+
+    exclude_ids = exclude_ids or set()
+    empty = {"context": "", "context_ids": [], "suggestions": []}
 
     try:
         [query_vector] = await embed_texts([query])
 
-        fetch_limit = config.RAG_TOP_K + config.RAG_SUGGESTION_COUNT
-
+        fetch_limit = config.RAG_TOP_K + config.RAG_SUGGESTION_COUNT + len(exclude_ids)
+ 
         questions_results, qa_results = await asyncio.gather(
             qdrant_client.query_points(
                 collection_name=config.QDRANT_QUESTIONS_COLLECTION,
@@ -76,6 +98,7 @@ async def retrieve(query: str) -> dict:
     ][: config.RAG_TOP_K]
 
     used_ids = {faq_id for faq_id, _, _ in top_entries}
+    context_ids = list(used_ids)
 
     if top_entries:
         logging.info(
@@ -96,12 +119,13 @@ async def retrieve(query: str) -> dict:
         )
         context = ""
 
-    # Whatever's left in the ranked pool (already above the looser threshold,
-    # already excluding what was used for the answer) becomes suggestions.
+    # Whatever's left in the ranked pool - already above the looser threshold,
+    # already excluding what was used for the answer this turn, AND excluding
+    # anything already asked/used in an earlier turn - becomes suggestions.
     suggestions = [
         {"id": faq_id, "question": payload["question"]}
         for faq_id, (score, payload) in ranked
-        if faq_id not in used_ids
+        if faq_id not in used_ids and faq_id not in exclude_ids
     ][: config.RAG_SUGGESTION_COUNT]
 
     if suggestions:
@@ -111,4 +135,4 @@ async def retrieve(query: str) -> dict:
             [s["question"] for s in suggestions],
         )
 
-    return {"context": context, "suggestions": suggestions}
+    return {"context": context, "context_ids": context_ids, "suggestions": suggestions}

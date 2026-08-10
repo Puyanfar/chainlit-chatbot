@@ -3,7 +3,7 @@ set -euo pipefail
 
 CONTAINER_NAME="qdrant"
 STORAGE_DIR="${QDRANT_STORAGE_DIR:-$HOME/qdrant_storage}"
-IMAGE="docker.io/qdrant/qdrant:latest"
+IMAGE="qdrant/qdrant"
 
 mkdir -p "$STORAGE_DIR"
 

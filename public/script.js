@@ -1,5 +1,5 @@
 (function () {
-  const SELECTOR = '.message-content *';
+  const SELECTOR = '.ai-message *';
 
   function tagDirection(root) {
     root.querySelectorAll(SELECTOR).forEach((el) => {
