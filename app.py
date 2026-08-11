@@ -1,18 +1,26 @@
 from openai import AsyncOpenAI
-from openai.types.chat import ChatCompletionMessageParam
+from openai.types.chat import (
+    ChatCompletionMessageParam,
+    ChatCompletionFunctionToolParam,
+)
 from typing import cast
 import chainlit as cl
-import logging
+import logging, json
 import config
 from rag import retrieve
+from mcp import ClientSession
+from mcp.types import Tool, ListToolsResult, ToolUseContent
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = {"role": "system", "content": config.SYSTEM_PROMPT}
-MAX_HISTORY_MESSAGES = config.MAX_HISTORY_MESSAGES
-ERROR_MARKER = "⚠️"
-FOLLOW_UP_ACTION_NAME = "follow_up_question"
-ASSISTANT_AUTHOR = "assistant"
+SYSTEM_PROMPT: ChatCompletionMessageParam = {
+    "role": "system",
+    "content": config.SYSTEM_PROMPT,
+}
+MAX_HISTORY_MESSAGES: int = config.MAX_HISTORY_MESSAGES
+ERROR_MARKER: str = "⚠️"
+FOLLOW_UP_ACTION_NAME: str = "follow_up_question"
+ASSISTANT_AUTHOR: str = "assistant"
 
 client = AsyncOpenAI(
     base_url=config.API_ENDPOINT,
@@ -49,15 +57,30 @@ async def clear_active_follow_ups() -> None:
         cl.user_session.set("active_follow_up_message", None)
 
 
-async def answer_question(question: str) -> None:
+async def answer_question(question: str) -> str:
     """Core answering logic, shared by both a typed message and a clicked
     follow-up suggestion: retrieve, stream the model's response, update
     history, then offer any follow-up suggestions as clickable actions."""
 
     await clear_active_follow_ups()
 
-    message_history = cl.user_session.get("message_history") or [SYSTEM_PROMPT]
-    used_faq_ids = cl.user_session.get("used_faq_ids") or set()
+    message_history: list[ChatCompletionMessageParam] = cl.user_session.get(
+        "message_history"
+    ) or [SYSTEM_PROMPT]
+    used_faq_ids: set[str] = cl.user_session.get("used_faq_ids") or set()
+    mcp_tools: dict[str, list[dict]] = cast(
+        dict[str, list[dict]], cl.user_session.get("mcp_tools", {})
+    )
+
+    tools = cast(
+        list[ChatCompletionFunctionToolParam],
+        [
+            tool
+            for connection_name, tool_list in mcp_tools.items()
+            for tool in tool_list
+        ],
+    )
+    # logger.info(f"Tools available for this session: {tools}")
 
     retrieval = await retrieve(question, exclude_ids=used_faq_ids)
     retrieved_context = retrieval["context"]
@@ -83,24 +106,18 @@ async def answer_question(question: str) -> None:
     stream_succeeded = False
 
     try:
-        stream = await client.chat.completions.create(
+        async with client.chat.completions.stream(
             model=config.MODEL,
-            messages=cast(list[ChatCompletionMessageParam], request_messages),
-            stream=True,
-        )
+            messages=request_messages,
+            # tools=tools,
+        ) as stream:
+            async for event in stream:
+                if event.type == "content.delta" and event.delta:
+                    await msg.stream_token(event.delta)
 
-        try:
-            async for chunk in stream:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    full_response += delta
-                    await msg.stream_token(delta)
+            final_completion = await stream.get_final_completion()
 
-        finally:
-            await stream.close()
-
+        full_response = final_completion.choices[0].message.content or ""
         stream_succeeded = True
 
     except Exception as e:
@@ -130,12 +147,93 @@ async def answer_question(question: str) -> None:
     if context_ids:
         cl.user_session.set("used_faq_ids", used_faq_ids | set(context_ids))
 
-
     if stream_succeeded and suggestions:
         actions = build_follow_up_actions(suggestions)
-        follow_up_message = cl.Message(content="", actions=actions, author=ASSISTANT_AUTHOR)
+        follow_up_message = cl.Message(
+            content="", actions=actions, author=ASSISTANT_AUTHOR
+        )
         await follow_up_message.send()
         cl.user_session.set("active_follow_up_message", follow_up_message)
+
+    return full_response
+
+
+@cl.on_mcp_connect
+async def on_mcp(connection, session: ClientSession):
+    # List available tools
+    result: ListToolsResult = await session.list_tools()
+
+    # Process tool metadata
+    tools: list[dict] = cast(
+        list[dict],
+        [
+            {
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.inputSchema,
+            }
+            for t in result.tools
+        ],
+    )
+
+    # Store tools for later use
+    mcp_tools: dict[str, list[dict]] = cast(
+        dict[str, list[dict]], cl.user_session.get("mcp_tools", {})
+    )
+    mcp_tools[connection.name] = tools
+    # logger.info(f"Available tools for connection '{connection.name}': {tools}")
+    cl.user_session.set("mcp_tools", mcp_tools)
+
+
+@cl.step(type="tool")
+async def call_tool(tool_use: ToolUseContent) -> str:
+    tool_name = tool_use.name
+    tool_input = tool_use.input
+
+    current_step = cl.context.current_step
+    if current_step is not None:
+        current_step.name = tool_name
+
+    # Identify which mcp is used
+    mcp_tools: dict[str, list[dict]] = cast(
+        dict[str, list[dict]], cl.user_session.get("mcp_tools", {})
+    )
+    mcp_name = None
+
+    for connection_name, tools in mcp_tools.items():
+        if any(tool.get("name") == tool_name for tool in tools):
+            mcp_name = connection_name
+            break
+
+    error_output = json.dumps(
+        {"error": f"Tool {tool_name} not found in any MCP connection"}
+    )
+    if not mcp_name:
+        if current_step is not None:
+            current_step.output = error_output
+        return error_output
+
+    mcp_sessions = getattr(cl.context.session, "mcp_sessions", {}) or {}
+    mcp_session = mcp_sessions.get(mcp_name)
+
+    if not mcp_session:
+        error_output = json.dumps(
+            {"error": f"MCP {mcp_name} not found in any MCP connection"}
+        )
+        if current_step is not None:
+            current_step.output = error_output
+        return error_output
+
+    try:
+        result = await mcp_session.call_tool(tool_name, tool_input)
+        if current_step is not None:
+            current_step.output = result
+        return result
+    except Exception as e:
+        error_output = json.dumps({"error": str(e)})
+        if current_step is not None:
+            current_step.output = error_output
+        return error_output
 
 
 @cl.on_chat_start
@@ -162,4 +260,3 @@ async def on_follow_up_click(action: cl.Action):
         # inside answer_question via clear_active_follow_ups().)
         await cl.Message(content=question, type="user_message").send()
         await answer_question(question)
-
