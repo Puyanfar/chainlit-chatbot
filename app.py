@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from openai import AsyncOpenAI, APIError
-from openai.types.responses import Response, ResponseInputParam, FunctionToolParam
+from openai.types.responses import Response, ResponseInputParam, FunctionToolParam, ResponseFunctionToolCall
 from mcp import ClientSession
 from mcp.types import ListToolsResult, ToolUseContent
 from typing import cast
@@ -55,23 +55,39 @@ async def stream_assistant_reply(
     """
     full_text = ""
     final_response: Response | None = None
+    working_inputs = list(input_items)
+    mcp_tools = cl.user_session.get("mcp_tools", {}) or {}
+    tools = [
+        tool for connection_name, tools_list in mcp_tools.items() for tool in tools_list
+    ]
 
     try:
         async with client.responses.stream(
             model=config.MODEL,
             instructions=SYSTEM_PROMPT,
-            input=input_items,
-            # tools=[],
+            input=working_inputs,
+            tools=tools,
         ) as stream:
             async for event in stream:
                 if event.type == "response.output_text.delta":
                     full_text += event.delta
                     await response_stream_message.stream_token(event.delta)
-                if (
+                elif (
                     event.type == "response.output_item.done"
                     and event.item.type == "function_call"
                 ):
-                    pass  # Call
+                    logger.info("function call used by model")
+                    item: ResponseFunctionToolCall = event.item
+                    arguments = json.loads(item.arguments)
+                    tool_name = item.name
+                    call_id = item.call_id
+                    working_inputs.append({"role": "assistant", "content": str(item)})
+                    tool_use = {"name":tool_name, "arguments": arguments, "call_id": call_id}
+                    await call_tool(
+                        tool_use,
+                        working_inputs,
+                        response_stream_message,
+                    )
                 elif event.type == "response.error":
                     # get_final_response()/the context manager will also
                     # surface this; logging here just keeps the timeline.
@@ -157,25 +173,29 @@ async def on_mcp(connection, session: ClientSession):
     ]
 
     # Store tools for later use
-    mcp_tools: dict[str, list[FunctionToolParam]] = cast(dict[str, list[FunctionToolParam]] ,cl.user_session.get("mcp_tools", {}))
+    mcp_tools: dict[str, list[FunctionToolParam]] = cast(
+        dict[str, list[FunctionToolParam]], cl.user_session.get("mcp_tools", {})
+    )
 
     mcp_tools[str(connection.name)] = tools
-    # logger.info(f"Available tools for connection '{connection.name}': {tools}")
+    logger.info(f"Available tools for connection '{connection.name}': {tools}")
     cl.user_session.set("mcp_tools", mcp_tools)
 
 
 @cl.step(type="tool")
-async def call_tool(tool_use: ToolUseContent) -> str:
-    tool_name = tool_use.name
-    tool_input = tool_use.input
+async def call_tool(tool_use, input_items, msg) -> str:
+    logger.info("call_tool was called!")
+    tool_name = tool_use["name"]
+    tool_arguments = tool_use["arguments"]
+    tool_call_id = tool_use["call_id"]
 
     current_step = cl.context.current_step
     if current_step is not None:
         current_step.name = tool_name
 
     # Identify which mcp is used
-    mcp_tools: dict[str, list[dict]] = cast(
-        dict[str, list[dict]], cl.user_session.get("mcp_tools", {})
+    mcp_tools: dict[str, list[FunctionToolParam]] = cast(
+        dict[str, list[FunctionToolParam]], cl.user_session.get("mcp_tools", {})
     )
     mcp_name = None
 
@@ -204,9 +224,17 @@ async def call_tool(tool_use: ToolUseContent) -> str:
         return error_output
 
     try:
-        result = await mcp_session.call_tool(tool_name, tool_input)
+        result = await mcp_session.call_tool(tool_name, tool_arguments)
         if current_step is not None:
             current_step.output = result
+        input_items.append(
+            {
+                "type": "function_call_output",
+                "call_id": tool_call_id,
+                "output": result if isinstance(result, str) else json.dumps(result),
+            }
+        )
+        await stream_assistant_reply(msg, input_items)
         return result
     except Exception as e:
         error_output = json.dumps({"error": str(e)})
