@@ -1,17 +1,25 @@
 from dataclasses import dataclass
 from openai import AsyncOpenAI, APIError
+from openai.types.responses import Response, ResponseInputParam, FunctionToolParam
 from mcp import ClientSession
-from openai.types.responses import EasyInputMessageParam, Response, ResponseInputParam
-from mcp.types import ListToolsResult, ToolUseContent, Tool
+from mcp.types import ListToolsResult, ToolUseContent
 from typing import cast
 from rag import build_augmented_question
+from helpers import (
+    get_message_history,
+    save_message_history,
+    get_used_faq_ids,
+    mark_faq_ids_used,
+    send_follow_up_suggestions,
+    clear_active_follow_ups,
+    mcp_tool_to_openai_tool,
+)
 import chainlit as cl
 import logging, json, config
 
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT: str = config.SYSTEM_PROMPT
-MAX_HISTORY_MESSAGES: int = config.MAX_HISTORY_MESSAGES
 ERROR_MARKER: str = "⚠️"
 FOLLOW_UP_ACTION_NAME: str = "follow_up_question"
 ASSISTANT_AUTHOR: str = "assistant"
@@ -22,62 +30,6 @@ client = AsyncOpenAI(
     timeout=config.REQUEST_TIMEOUT,
     max_retries=config.MAX_RETRIES,
 )
-
-
-def get_message_history() -> list[EasyInputMessageParam]:
-    return cl.user_session.get("message_history") or []
-
-
-def save_message_history(history: list[EasyInputMessageParam]) -> None:
-    if len(history) > MAX_HISTORY_MESSAGES:
-        history = history[-MAX_HISTORY_MESSAGES:]
-    cl.user_session.set("message_history", history)
-
-
-def get_used_faq_ids() -> set[str]:
-    return cl.user_session.get("used_faq_ids") or set()
-
-
-def mark_faq_ids_used(context_ids: list[str]) -> None:
-    if not context_ids:
-        return
-    used = get_used_faq_ids()
-    cl.user_session.set("used_faq_ids", used | set(context_ids))
-
-
-async def send_follow_up_suggestions(suggestions: list) -> None:
-    if not suggestions:
-        return
-    actions = build_follow_up_actions(suggestions)
-    follow_up_message = cl.Message(content="", actions=actions, author=ASSISTANT_AUTHOR)
-    await follow_up_message.send()
-    cl.user_session.set("active_follow_up_message", follow_up_message)
-
-
-def build_follow_up_actions(suggestions: list[dict]) -> list[cl.Action]:
-    """One cl.Action per suggestion, all sharing the same action name - each carries its own
-    question text in its payload so the callback knows which was clicked."""
-    return [
-        cl.Action(
-            name=FOLLOW_UP_ACTION_NAME,
-            payload={"question": suggestion["question"]},
-            label=suggestion["question"],
-        )
-        for suggestion in suggestions
-    ]
-
-
-async def clear_active_follow_ups() -> None:
-    """Remove the buttons from whatever follow-up suggestion message is
-    currently outstanding, if any. Called at the very start of handling any
-    new question - typed or clicked - so there's only ever one live set of
-    suggestions on screen at a time, regardless of how the previous round
-    was resolved."""
-
-    active_message = cl.user_session.get("active_follow_up_message")
-    if active_message:
-        await active_message.remove()
-        cl.user_session.set("active_follow_up_message", None)
 
 
 @dataclass
@@ -109,11 +61,17 @@ async def stream_assistant_reply(
             model=config.MODEL,
             instructions=SYSTEM_PROMPT,
             input=input_items,
+            # tools=[],
         ) as stream:
             async for event in stream:
                 if event.type == "response.output_text.delta":
                     full_text += event.delta
                     await response_stream_message.stream_token(event.delta)
+                if (
+                    event.type == "response.output_item.done"
+                    and event.item.type == "function_call"
+                ):
+                    pass  # Call
                 elif event.type == "response.error":
                     # get_final_response()/the context manager will also
                     # surface this; logging here just keeps the timeline.
@@ -194,23 +152,14 @@ async def on_mcp(connection, session: ClientSession):
     # logger.info(f"Available tools for connection '{connection.name}': {result.tools}")
 
     # Process tool metadata
-    tools: list[dict] = cast(
-        list[dict],
-        [
-            {
-                "name": t.name,
-                "description": t.description,
-                "input_schema": t.inputSchema,
-            }
-            for t in result.tools
-        ],
-    )
+    tools: list[FunctionToolParam] = [
+        mcp_tool_to_openai_tool(tool) for tool in result.tools
+    ]
 
     # Store tools for later use
-    mcp_tools: dict[str, list[dict]] = cast(
-        dict[str, list[dict]], cl.user_session.get("mcp_tools", {})
-    )
-    mcp_tools[connection.name] = tools
+    mcp_tools: dict[str, list[FunctionToolParam]] = cast(dict[str, list[FunctionToolParam]] ,cl.user_session.get("mcp_tools", {}))
+
+    mcp_tools[str(connection.name)] = tools
     # logger.info(f"Available tools for connection '{connection.name}': {tools}")
     cl.user_session.set("mcp_tools", mcp_tools)
 
