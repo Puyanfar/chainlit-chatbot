@@ -1,22 +1,16 @@
-from openai import AsyncOpenAI
-from openai.types.chat import (
-    ChatCompletionMessageParam,
-    ChatCompletionFunctionToolParam,
-)
-from typing import cast
-import chainlit as cl
-import logging, json
-import config
-from rag import retrieve
+from dataclasses import dataclass
+from openai import AsyncOpenAI, APIError
 from mcp import ClientSession
-from mcp.types import Tool, ListToolsResult, ToolUseContent
+from openai.types.responses import EasyInputMessageParam, Response, ResponseInputParam
+from mcp.types import ListToolsResult, ToolUseContent, Tool
+from typing import cast
+from rag import build_augmented_question
+import chainlit as cl
+import logging, json, config
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT: ChatCompletionMessageParam = {
-    "role": "system",
-    "content": config.SYSTEM_PROMPT,
-}
+SYSTEM_PROMPT: str = config.SYSTEM_PROMPT
 MAX_HISTORY_MESSAGES: int = config.MAX_HISTORY_MESSAGES
 ERROR_MARKER: str = "⚠️"
 FOLLOW_UP_ACTION_NAME: str = "follow_up_question"
@@ -30,9 +24,38 @@ client = AsyncOpenAI(
 )
 
 
+def get_message_history() -> list[EasyInputMessageParam]:
+    return cl.user_session.get("message_history") or []
+
+
+def save_message_history(history: list[EasyInputMessageParam]) -> None:
+    if len(history) > MAX_HISTORY_MESSAGES:
+        history = history[-MAX_HISTORY_MESSAGES:]
+    cl.user_session.set("message_history", history)
+
+
+def get_used_faq_ids() -> set[str]:
+    return cl.user_session.get("used_faq_ids") or set()
+
+
+def mark_faq_ids_used(context_ids: list[str]) -> None:
+    if not context_ids:
+        return
+    used = get_used_faq_ids()
+    cl.user_session.set("used_faq_ids", used | set(context_ids))
+
+
+async def send_follow_up_suggestions(suggestions: list) -> None:
+    if not suggestions:
+        return
+    actions = build_follow_up_actions(suggestions)
+    follow_up_message = cl.Message(content="", actions=actions, author=ASSISTANT_AUTHOR)
+    await follow_up_message.send()
+    cl.user_session.set("active_follow_up_message", follow_up_message)
+
+
 def build_follow_up_actions(suggestions: list[dict]) -> list[cl.Action]:
-    """One cl.Action per suggestion, all sharing the same action name (the
-    callback below is registered against that name) - each carries its own
+    """One cl.Action per suggestion, all sharing the same action name - each carries its own
     question text in its payload so the callback knows which was clicked."""
     return [
         cl.Action(
@@ -57,111 +80,118 @@ async def clear_active_follow_ups() -> None:
         cl.user_session.set("active_follow_up_message", None)
 
 
-async def answer_question(question: str) -> str:
+@dataclass
+class StreamResult:
+    text: str
+    response: Response | None
+    error: Exception | None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and self.response is not None
+
+
+async def stream_assistant_reply(
+    response_stream_message: cl.Message, input_items: ResponseInputParam
+) -> StreamResult:
+    """Stream a Responses API reply into an existing Chainlit message.
+
+    Tokens are pushed to `response_stream_message` as they arrive via `stream_token`
+    (Chainlit appends them to `response_stream_message.content` itself). Returns whatever
+    text was produced even on failure, so the caller can show a
+    "cut off" message instead of losing partial output.
+    """
+    full_text = ""
+    final_response: Response | None = None
+
+    try:
+        async with client.responses.stream(
+            model=config.MODEL,
+            instructions=SYSTEM_PROMPT,
+            input=input_items,
+        ) as stream:
+            async for event in stream:
+                if event.type == "response.output_text.delta":
+                    full_text += event.delta
+                    await response_stream_message.stream_token(event.delta)
+                elif event.type == "response.error":
+                    # get_final_response()/the context manager will also
+                    # surface this; logging here just keeps the timeline.
+                    logger.error("Responses API stream error: %s", event.error)
+
+            final_response = await stream.get_final_response()
+
+        if final_response.status != "completed":
+            detail = final_response.error.message if final_response.error else None
+            raise RuntimeError(
+                f"model response ended with status={final_response.status!r}"
+                + (f": {detail}" if detail else "")
+            )
+
+        return StreamResult(text=full_text, response=final_response, error=None)
+
+    except APIError as e:
+        logger.exception(f"OpenAI API error while streaming response: {e}")
+        return StreamResult(text=full_text, response=final_response, error=e)
+    except Exception as e:  # noqa: BLE001 - deliberately broad, surfaced to the user
+        logger.exception(f"Unexpected error while streaming response: {e}")
+        return StreamResult(text=full_text, response=final_response, error=e)
+
+
+async def answer_question(question: str) -> Response | None:
     """Core answering logic, shared by both a typed message and a clicked
     follow-up suggestion: retrieve, stream the model's response, update
     history, then offer any follow-up suggestions as clickable actions."""
 
     await clear_active_follow_ups()
 
-    message_history: list[ChatCompletionMessageParam] = cl.user_session.get(
-        "message_history"
-    ) or [SYSTEM_PROMPT]
-    used_faq_ids: set[str] = cl.user_session.get("used_faq_ids") or set()
-    mcp_tools: dict[str, list[dict]] = cast(
-        dict[str, list[dict]], cl.user_session.get("mcp_tools", {})
-    )
+    history = get_message_history()
+    used_faq_ids = get_used_faq_ids()
 
-    tools = cast(
-        list[ChatCompletionFunctionToolParam],
-        [
-            tool
-            for connection_name, tool_list in mcp_tools.items()
-            for tool in tool_list
-        ],
-    )
-    # logger.info(f"Tools available for this session: {tools}")
+    retrieval = await build_augmented_question(question, used_faq_ids)
 
-    retrieval = await retrieve(question, exclude_ids=used_faq_ids)
-    retrieved_context = retrieval["context"]
-    suggestions = retrieval["suggestions"]
-    context_ids = retrieval["context_ids"]
-
-    augmented_content = f"User Question:\n {question}\n\n"
-
-    if retrieved_context:
-        augmented_content += f"Reference Information:\n{retrieved_context}\n\n"
-    else:
-        augmented_content += "Reference Information:\n No relevant information was found in the knowledge base.\n\n"
-
-    request_messages = message_history + [
-        {"role": "user", "content": augmented_content}
+    request_input: ResponseInputParam = [
+        *history,
+        {"role": "user", "content": retrieval.augmented_content},
     ]
-    message_history.append({"role": "user", "content": question})
 
     msg = cl.Message(content="", author=ASSISTANT_AUTHOR)
     await msg.send()
-    full_response = ""
 
-    stream_succeeded = False
+    result = await stream_assistant_reply(msg, request_input)
 
-    try:
-        async with client.chat.completions.stream(
-            model=config.MODEL,
-            messages=request_messages,
-            # tools=tools,
-        ) as stream:
-            async for event in stream:
-                if event.type == "content.delta" and event.delta:
-                    await msg.stream_token(event.delta)
-
-            final_completion = await stream.get_final_completion()
-
-        full_response = final_completion.choices[0].message.content or ""
-        stream_succeeded = True
-
-    except Exception as e:
-        logger.exception("Error while streaming response from model")
-
-        if full_response:
+    if not result.ok:
+        if result.text:
             msg.content = (
-                full_response
-                + f"\n\n{ERROR_MARKER} ERROR! *Response cut off: something went wrong talking to the model: {e}"
+                result.text + f"\n\n{ERROR_MARKER} ERROR! *Response cut off: "
+                f"something went wrong talking to the model: {result.error}*"
             )
-
         else:
-            msg.content = f"{ERROR_MARKER} ERROR! Sorry, something went wrong talking to the model: {e}"
-
-    await msg.update()
-
-    if stream_succeeded and full_response:
-        message_history.append({"role": "assistant", "content": full_response})
-
-        if len(message_history) > MAX_HISTORY_MESSAGES + 1:
-            message_history = [SYSTEM_PROMPT] + message_history[-MAX_HISTORY_MESSAGES:]
-
-        cl.user_session.set("message_history", message_history)
-
-    # Whatever FAQ entries grounded this answer are now "used" - never
-    # suggest them again as a follow-up for the rest of this session.
-    if context_ids:
-        cl.user_session.set("used_faq_ids", used_faq_ids | set(context_ids))
-
-    if stream_succeeded and suggestions:
-        actions = build_follow_up_actions(suggestions)
-        follow_up_message = cl.Message(
-            content="", actions=actions, author=ASSISTANT_AUTHOR
+            msg.content = (
+                f"{ERROR_MARKER} ERROR! Sorry, something went wrong "
+                f"talking to the model: {result.error}"
+            )
+        await msg.update()
+    else:
+        await msg.update()
+        save_message_history(
+            [
+                *history,
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": result.text},
+            ]
         )
-        await follow_up_message.send()
-        cl.user_session.set("active_follow_up_message", follow_up_message)
+        mark_faq_ids_used(retrieval.context_ids)
+        await send_follow_up_suggestions(retrieval.suggestions)
 
-    return full_response
+    return result.response
 
 
 @cl.on_mcp_connect
 async def on_mcp(connection, session: ClientSession):
     # List available tools
     result: ListToolsResult = await session.list_tools()
+    # logger.info(f"Available tools for connection '{connection.name}': {result.tools}")
 
     # Process tool metadata
     tools: list[dict] = cast(
@@ -238,7 +268,7 @@ async def call_tool(tool_use: ToolUseContent) -> str:
 
 @cl.on_chat_start
 async def start():
-    cl.user_session.set("message_history", [SYSTEM_PROMPT])
+    cl.user_session.set("message_history", [])
     cl.user_session.set("active_follow_up_message", None)
     cl.user_session.set("used_faq_ids", set())
 
@@ -252,11 +282,5 @@ async def main(message: cl.Message):
 async def on_follow_up_click(action: cl.Action):
     question = action.payload.get("question", "")
     if question:
-        # A callback-triggered message doesn't go through the normal user-input
-        # path, so nothing puts it in the UI on its own - explicitly send it as
-        # a user-authored bubble before generating the answer, so the click
-        # reads exactly like the user having typed the question themselves.
-        # (The clicked button itself, and any other stale ones, get cleared
-        # inside answer_question via clear_active_follow_ups().)
         await cl.Message(content=question, type="user_message").send()
         await answer_question(question)

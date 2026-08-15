@@ -3,3 +3,4 @@ python-dotenv
 openai
 qdrant-client
 uvicorn[standard]
+mcp[cli]

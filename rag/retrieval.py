@@ -8,6 +8,7 @@ import asyncio
 import logging
 import config
 from rag.clients import embed_texts, qdrant_client
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -25,12 +26,12 @@ async def retrieve(query: str, exclude_ids: set[str] | None = None) -> dict:
         RAG_SUGGESTION_SCORE_THRESHOLD, weren't already used for context this
         turn, AND aren't in exclude_ids - i.e. weren't already asked/used in
         an earlier turn this session).
- 
+
     exclude_ids only affects the *suggestions* list, never grounding - if the
     user re-asks something close to a question they already covered, it can
     still ground a fresh answer; it just won't be offered again as a "you
     might also ask" suggestion.
- 
+
     These two outputs are otherwise independent - the score gap between the
     two thresholds means there's a real middle ground: candidates related
     enough to suggest but not confident enough to answer with. In that case
@@ -39,7 +40,7 @@ async def retrieve(query: str, exclude_ids: set[str] | None = None) -> dict:
     never separately generated - they're always a subset of what we already
     retrieved, so every suggestion is guaranteed to be a real, answerable
     FAQ entry.
- 
+
     Returns {"context": str, "context_ids": [str, ...],
              "suggestions": [{"id": str, "question": str}, ...]}.
     context/context_ids/suggestions are all empty only when nothing clears
@@ -53,7 +54,7 @@ async def retrieve(query: str, exclude_ids: set[str] | None = None) -> dict:
         [query_vector] = await embed_texts([query])
 
         fetch_limit = config.RAG_TOP_K + config.RAG_SUGGESTION_COUNT + len(exclude_ids)
- 
+
         questions_results, qa_results = await asyncio.gather(
             qdrant_client.query_points(
                 collection_name=config.QDRANT_QUESTIONS_COLLECTION,
@@ -136,3 +137,34 @@ async def retrieve(query: str, exclude_ids: set[str] | None = None) -> dict:
         )
 
     return {"context": context, "context_ids": context_ids, "suggestions": suggestions}
+
+
+@dataclass
+class RetrievalResult:
+    augmented_content: str
+    suggestions: list
+    context_ids: list[str]
+
+
+async def build_augmented_question(
+    question: str, used_faq_ids: set[str]
+) -> RetrievalResult:
+    """Fetch RAG context for `question` and format it into the content
+    block that gets sent to the model (never stored verbatim in history)."""
+    retrieval = await retrieve(question, exclude_ids=used_faq_ids)
+    retrieved_context = retrieval["context"]
+
+    augmented_content = f"User Question:\n {question}\n\n"
+    if retrieved_context:
+        augmented_content += f"Reference Information:\n{retrieved_context}\n\n"
+    else:
+        augmented_content += (
+            "Reference Information:\n"
+            " No relevant information was found in the knowledge base.\n\n"
+        )
+
+    return RetrievalResult(
+        augmented_content=augmented_content,
+        suggestions=retrieval["suggestions"],
+        context_ids=retrieval["context_ids"],
+    )
