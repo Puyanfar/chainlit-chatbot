@@ -76,12 +76,12 @@ async def stream_assistant_reply(
                     event.type == "response.output_item.done"
                     and event.item.type == "function_call"
                 ):
-                    logger.info("function call used by model")
                     item: ResponseFunctionToolCall = event.item
                     arguments = json.loads(item.arguments)
                     tool_name = item.name
                     call_id = item.call_id
-                    working_inputs.append({"role": "assistant", "content": str(item)})
+                    logger.info(f"function call request by the model: item={item}, tool name={tool_name}, arguments={arguments}, call id={call_id}")
+                    working_inputs.append({"type": "function_call", "call_id": call_id, "name": tool_name, "arguments": item.arguments})
                     tool_use = {"name":tool_name, "arguments": arguments, "call_id": call_id}
                     await call_tool(
                         tool_use,
@@ -107,7 +107,7 @@ async def stream_assistant_reply(
     except APIError as e:
         logger.exception(f"OpenAI API error while streaming response: {e}")
         return StreamResult(text=full_text, response=final_response, error=e)
-    except Exception as e:  # noqa: BLE001 - deliberately broad, surfaced to the user
+    except Exception as e:
         logger.exception(f"Unexpected error while streaming response: {e}")
         return StreamResult(text=full_text, response=final_response, error=e)
 
@@ -165,7 +165,6 @@ async def answer_question(question: str) -> Response | None:
 async def on_mcp(connection, session: ClientSession):
     # List available tools
     result: ListToolsResult = await session.list_tools()
-    # logger.info(f"Available tools for connection '{connection.name}': {result.tools}")
 
     # Process tool metadata
     tools: list[FunctionToolParam] = [
@@ -178,16 +177,16 @@ async def on_mcp(connection, session: ClientSession):
     )
 
     mcp_tools[str(connection.name)] = tools
-    logger.info(f"Available tools for connection '{connection.name}': {tools}")
     cl.user_session.set("mcp_tools", mcp_tools)
 
 
 @cl.step(type="tool")
 async def call_tool(tool_use, input_items, msg) -> str:
-    logger.info("call_tool was called!")
     tool_name = tool_use["name"]
     tool_arguments = tool_use["arguments"]
     tool_call_id = tool_use["call_id"]
+    logger.info(f"call_tool was called! {tool_name=} {tool_arguments=} {tool_call_id}")
+    logger.info(f"The input items array: {input_items}")
 
     current_step = cl.context.current_step
     if current_step is not None:
@@ -210,36 +209,44 @@ async def call_tool(tool_use, input_items, msg) -> str:
     if not mcp_name:
         if current_step is not None:
             current_step.output = error_output
+        logger.error(error_output)
         return error_output
 
     mcp_sessions = getattr(cl.context.session, "mcp_sessions", {}) or {}
-    mcp_session = mcp_sessions.get(mcp_name)
+    mcp_wrapper = mcp_sessions.get(mcp_name)
 
-    if not mcp_session:
+    if not mcp_wrapper:
         error_output = json.dumps(
             {"error": f"MCP {mcp_name} not found in any MCP connection"}
         )
         if current_step is not None:
             current_step.output = error_output
+        logger.error(error_output)
         return error_output
+    mcp_session = mcp_wrapper.client
 
     try:
         result = await mcp_session.call_tool(tool_name, tool_arguments)
         if current_step is not None:
             current_step.output = result
+        logger.info(f"tool cal {result=}, text={result.content[0].text}")
         input_items.append(
             {
                 "type": "function_call_output",
                 "call_id": tool_call_id,
-                "output": result if isinstance(result, str) else json.dumps(result),
+                "output": result.content[0].text if isinstance(result.content[0].text, str) else json.dumps(result.structuredContent),
             }
         )
+        logger.info("before LLM call for tool call response")
         await stream_assistant_reply(msg, input_items)
+        logger.info("after LLM call for tool call response")
+
         return result
     except Exception as e:
         error_output = json.dumps({"error": str(e)})
         if current_step is not None:
             current_step.output = error_output
+        logger.error(error_output)
         return error_output
 
 
