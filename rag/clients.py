@@ -5,7 +5,8 @@ each creating their own - so connection settings, auth, etc. only ever need
 to change in one place.
 """
 
-from openai import AsyncOpenAI
+from langfuse.openai import AsyncOpenAI  # type: ignore
+from langfuse import observe
 from qdrant_client import AsyncQdrantClient
 import config
 
@@ -21,6 +22,7 @@ qdrant_client = AsyncQdrantClient(
 )
 
 
+@observe
 async def embed_texts(texts: list[str]) -> list[list[float]]:
     """Embed a list of strings in a single OpenAI API call."""
     response = await embedding_client.embeddings.create(

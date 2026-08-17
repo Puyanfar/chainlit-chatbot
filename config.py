@@ -1,6 +1,7 @@
 import os
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+from langfuse.openai import AsyncOpenAI  # type: ignore
+from langfuse import observe
 import logging
 
 load_dotenv()
@@ -28,6 +29,7 @@ EMBEDDING_BATCH_SIZE: int = int(os.getenv("EMBEDDING_BATCH_SIZE", "100"))
 EMBEDDING_SIZE: int | None = None
 
 
+@observe
 async def initialize_embedding_size():
     global EMBEDDING_SIZE
 
@@ -64,7 +66,9 @@ QDRANT_QA_COLLECTION: str = os.getenv("QDRANT_QA_COLLECTION", "faq_qa")
 RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "3"))
 RAG_SUGGESTION_COUNT: int = int(os.getenv("RAG_SUGGESTION_COUNT", "3"))
 RAG_SCORE_THRESHOLD: float = float(os.getenv("RAG_SCORE_THRESHOLD", "0.4"))
-RAG_SUGGESTION_SCORE_THRESHOLD: float = float(os.getenv("RAG_SUGGESTION_SCORE_THRESHOLD", "0.35"))
+RAG_SUGGESTION_SCORE_THRESHOLD: float = float(
+    os.getenv("RAG_SUGGESTION_SCORE_THRESHOLD", "0.35")
+)
 
 
 FAQ_DATA_PATH: str = os.getenv("FAQ_DATA_PATH", "data/faq_data.json")

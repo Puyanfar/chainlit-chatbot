@@ -1,8 +1,15 @@
 from dataclasses import dataclass
-from openai import AsyncOpenAI, APIError
-from openai.types.responses import Response, ResponseInputParam, FunctionToolParam, ResponseFunctionToolCall
+from langfuse.openai import AsyncOpenAI  # type: ignore[reportAttributeAccessIssue]
+from langfuse import observe
+from openai import APIError
+from openai.types.responses import (
+    Response,
+    ResponseInputParam,
+    FunctionToolParam,
+    ResponseFunctionToolCall,
+)
 from mcp import ClientSession
-from mcp.types import ListToolsResult, ToolUseContent
+from mcp.types import ListToolsResult
 from typing import cast
 from rag import build_augmented_question
 from helpers import (
@@ -43,6 +50,7 @@ class StreamResult:
         return self.error is None and self.response is not None
 
 
+@observe
 async def stream_assistant_reply(
     response_stream_message: cl.Message, input_items: ResponseInputParam
 ) -> StreamResult:
@@ -80,8 +88,19 @@ async def stream_assistant_reply(
                     arguments = json.loads(item.arguments)
                     tool_name = item.name
                     call_id = item.call_id
-                    working_inputs.append({"type": "function_call", "call_id": call_id, "name": tool_name, "arguments": item.arguments})
-                    tool_use = {"name":tool_name, "arguments": arguments, "call_id": call_id}
+                    working_inputs.append(
+                        {
+                            "type": "function_call",
+                            "call_id": call_id,
+                            "name": tool_name,
+                            "arguments": item.arguments,
+                        }
+                    )
+                    tool_use = {
+                        "name": tool_name,
+                        "arguments": arguments,
+                        "call_id": call_id,
+                    }
                     await call_tool(
                         tool_use,
                         working_inputs,
@@ -230,7 +249,11 @@ async def call_tool(tool_use, input_items, msg) -> str:
             {
                 "type": "function_call_output",
                 "call_id": tool_call_id,
-                "output": result.content[0].text if isinstance(result.content[0].text, str) else json.dumps(result.structuredContent),
+                "output": (
+                    result.content[0].text
+                    if isinstance(result.content[0].text, str)
+                    else json.dumps(result.structuredContent)
+                ),
             }
         )
         await stream_assistant_reply(msg, input_items)
