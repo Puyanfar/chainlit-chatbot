@@ -80,7 +80,6 @@ async def stream_assistant_reply(
                     arguments = json.loads(item.arguments)
                     tool_name = item.name
                     call_id = item.call_id
-                    logger.info(f"function call request by the model: item={item}, tool name={tool_name}, arguments={arguments}, call id={call_id}")
                     working_inputs.append({"type": "function_call", "call_id": call_id, "name": tool_name, "arguments": item.arguments})
                     tool_use = {"name":tool_name, "arguments": arguments, "call_id": call_id}
                     await call_tool(
@@ -185,8 +184,6 @@ async def call_tool(tool_use, input_items, msg) -> str:
     tool_name = tool_use["name"]
     tool_arguments = tool_use["arguments"]
     tool_call_id = tool_use["call_id"]
-    logger.info(f"call_tool was called! {tool_name=} {tool_arguments=} {tool_call_id}")
-    logger.info(f"The input items array: {input_items}")
 
     current_step = cl.context.current_step
     if current_step is not None:
@@ -229,7 +226,6 @@ async def call_tool(tool_use, input_items, msg) -> str:
         result = await mcp_session.call_tool(tool_name, tool_arguments)
         if current_step is not None:
             current_step.output = result
-        logger.info(f"tool cal {result=}, text={result.content[0].text}")
         input_items.append(
             {
                 "type": "function_call_output",
@@ -237,9 +233,7 @@ async def call_tool(tool_use, input_items, msg) -> str:
                 "output": result.content[0].text if isinstance(result.content[0].text, str) else json.dumps(result.structuredContent),
             }
         )
-        logger.info("before LLM call for tool call response")
         await stream_assistant_reply(msg, input_items)
-        logger.info("after LLM call for tool call response")
 
         return result
     except Exception as e:
